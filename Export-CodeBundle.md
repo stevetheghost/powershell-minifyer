@@ -23,8 +23,29 @@ The output goes to `./SomeProject-bundle.txt` unless you pass `-OutFile`. Add `-
 - **Other text files** (markdown, YAML, etc.) are copied as they are, except that trailing spaces are removed and runs of blank lines become one.
 - **Output format:** the file opens with one line telling the other AI that the code is minified. Each file then starts with a `==> path <==` header. When it finishes, the script prints the file count, the size before and after, and a rough token estimate.
 
+## Aggressive mode
+
+```bash
+pwsh ./Export-CodeBundle.ps1 -Path ~/dev/SomeProject -Aggressive
+```
+
+`-Aggressive` also removes line breaks and the spaces next to punctuation, where the language allows it. The output uses fewer tokens but is harder to read. Text inside strings is still never changed.
+
+| Languages | What `-Aggressive` does |
+|---|---|
+| Java, C#, C/C++, Rust | Each file goes onto one line, and spaces next to `{ } ( ) [ ] ; , =` are removed. C and C# `#if`/`#define` lines stay on their own lines. |
+| CSS, SCSS, LESS | Each file goes onto one line, and spaces next to `{ } ; ,` and after `:` are removed. Spaces around `(` stay, because `and (max-width…)` needs them. |
+| JS/TS, Kotlin, Scala, Go, Groovy/Gradle, Dart, PHP | A line break can end a statement in these languages, so only the safe ones are removed: breaks after `{ ( [ , ; =`, and before `} ) ]` or a `.method()` chain. Spaces next to punctuation are removed as for Java. |
+| Swift | Only the safe line breaks are removed. Spaces stay, because Swift rejects uneven spacing around operators. |
+| XML (`.xml`, `.csproj`, `.config`, `.xaml`, …) | Each file goes onto one line, with no whitespace between tags or around attribute `=`. The `<?xml …?>` declaration is dropped. |
+| HTML, Vue, Svelte | Whitespace between tags is removed. Line breaks elsewhere stay, because `<script>` blocks are JavaScript. |
+| JSON | No change: the default mode already removes all whitespace outside strings. |
+
+Other languages (Python, Ruby, shell, PowerShell, SQL, …) are minified the same way as without `-Aggressive`.
+
 ## Things you might trip over
 
 - `.env.example` is also skipped, because `.env.*` is excluded to keep secrets out.
 - Folders named `bin`, `build` or `out` are skipped even if they hold real source. For example, a Node CLI's `bin/cli.js` would be left out. You can override the list with `-ExcludeDirs`.
+- With `-Aggressive`, whitespace between HTML/XML tags is removed, so text like `<b>a</b> <i>b</i>` reads as `ab`. That's fine for code, but it could matter if the other AI is reviewing page text.
 - The minifier uses regex, not a full parser, so rare cases can get past it (for example, nested template strings in JS). When that happens it only removes less; it shouldn't damage your code.

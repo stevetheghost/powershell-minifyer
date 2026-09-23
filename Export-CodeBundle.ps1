@@ -23,6 +23,18 @@
     Line breaks are kept, so code stays readable and newline-sensitive
     languages (JS ASI, preprocessor directives, shell) keep working.
 
+    With -Aggressive, line breaks and spaces are squeezed out as well:
+      - Java, C#, C/C++, Rust, CSS/SCSS: each file goes on one line (C/C#
+        preprocessor directives keep their own lines), and spaces next to
+        { } ( ) [ ] ; , = are dropped
+      - JS/TS, Kotlin, Scala, Swift, Go, Groovy/Gradle, Dart, PHP: a line break
+        can end a statement in these, so only breaks that can't are removed
+        (after { ( [ , ; = and before } ) ] or a .method() chain)
+      - XML: one line, no whitespace between tags or around attribute '=',
+        <?xml ...?> declaration dropped
+      - HTML/Vue/Svelte: whitespace between tags removed
+    JSON is already whitespace-free in the default mode.
+
     Other text files (markdown, yaml, txt, ...) are included as-is, apart from
     trimming trailing whitespace and collapsing repeated blank lines.
 
@@ -42,8 +54,15 @@
 .PARAMETER NoGitignore
     Don't apply .gitignore rules.
 
+.PARAMETER Aggressive
+    Also remove line breaks and spaces around punctuation where the language
+    allows it. Fewer tokens, less readable.
+
 .EXAMPLE
     ./Export-CodeBundle.ps1 -Path ./MyProject
+
+.EXAMPLE
+    ./Export-CodeBundle.ps1 -Path ./MyProject -Aggressive
 
 .EXAMPLE
     ./Export-CodeBundle.ps1 -Path ./MyProject -OutFile ./upload.txt -ExcludeDirs @('docs') -Verbose
@@ -75,7 +94,8 @@ param(
         # generated / low value for an AI
         '*.min.js', '*.min.css', '*.map', '*.svg', '.DS_Store'
     ),
-    [switch]$NoGitignore
+    [switch]$NoGitignore,
+    [switch]$Aggressive
 )
 
 $BinaryExtensions = @(
@@ -130,27 +150,50 @@ $P = @{
 }
 
 function New-LangSpec {
-    param([string[]]$Strings, [string[]]$Comments, [string]$Mode)
+    param([string[]]$Strings, [string[]]$Comments, [string]$Mode, [hashtable]$Aggr)
     $parts = @()
     if ($Strings) { $parts += '(?<s>' + ($Strings -join '|') + ')' }
     if ($Comments) { $parts += '(?<c>' + ($Comments -join '|') + ')' }
     [pscustomobject]@{
         Regex = [regex]::new(($parts -join '|'), 'Singleline')
         Mode  = $Mode   # strip | indent | json
+        Aggr  = $Aggr   # -Aggressive rules, see Convert-AggressiveContent
     }
 }
 
+# Matches spaces that can be dropped next to the given punctuation. With
+# -Equals, spaces around '=' go too, except right after another operator
+# character, so `x! = y` (TypeScript) never turns into `x!=y`.
+function Get-SpacingPattern {
+    param([string]$Chars, [switch]$Equals)
+    $p = "(?<=[$Chars])[ \t]+|[ \t]+(?=[$Chars])"
+    if ($Equals) { $p += '|(?<==)[ \t]+|(?<![!<>=+\-*/%&|^~?:.])[ \t]+(?==)' }
+    return $p
+}
+
+$SpaceBrace = Get-SpacingPattern '{}()\[\];,' -Equals
+$AggrJoin   = @{ Style = 'join'; Spacing = $SpaceBrace }
+$AggrJoinPP = @{ Style = 'join'; Spacing = $SpaceBrace; Directives = $true }
+$AggrLines  = @{ Style = 'lines'; JoinAfter = '{(\[,;='; Spacing = $SpaceBrace }
+# Swift errors on lopsided spacing around operators (`a !=b`), so it only
+# gets the safe line joins, and never after '='.
+$AggrSwift  = @{ Style = 'lines'; JoinAfter = '{(\[,;' }
+# CSS: spaces matter around ( ) (`and (max-width...)`), so only { } ; , and after ':'
+$AggrCss    = @{ Style = 'join'; Spacing = '(?<=[{};,:])[ \t]+|[ \t]+(?=[{};,])' }
+
 $Specs = @{
-    c      = New-LangSpec @($P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip'
-    cs     = New-LangSpec @($P.TripleDq, $P.CsVerb, $P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip'
-    jvm    = New-LangSpec @($P.TripleDq, $P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip'
-    groovy = New-LangSpec @($P.TripleDq, $P.TripleSq, $P.Dq, $P.Sq) @($P.LineC, $P.BlockC) 'strip'
-    js     = New-LangSpec @($P.RegexLit, $P.Template, $P.Dq, $P.Sq) @($P.LineC, $P.BlockC) 'strip'
-    go     = New-LangSpec @($P.GoRaw, $P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip'
-    rust   = New-LangSpec @($P.RustRaw, $P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip'
-    php    = New-LangSpec @($P.Dq, $P.Sq) @($P.LineC, $P.BlockC, $P.PhpHash) 'strip'
-    css    = New-LangSpec @($P.CssUrl, $P.Dq, $P.Sq) @($P.BlockC) 'strip'
-    scss   = New-LangSpec @($P.CssUrl, $P.Dq, $P.Sq) @($P.LineC, $P.BlockC) 'strip'
+    c      = New-LangSpec @($P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip' $AggrJoinPP
+    cs     = New-LangSpec @($P.TripleDq, $P.CsVerb, $P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip' $AggrJoinPP
+    java   = New-LangSpec @($P.TripleDq, $P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip' $AggrJoin
+    jvm    = New-LangSpec @($P.TripleDq, $P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip' $AggrLines
+    swift  = New-LangSpec @($P.TripleDq, $P.Dq) @($P.LineC, $P.BlockC) 'strip' $AggrSwift
+    groovy = New-LangSpec @($P.TripleDq, $P.TripleSq, $P.Dq, $P.Sq) @($P.LineC, $P.BlockC) 'strip' $AggrLines
+    js     = New-LangSpec @($P.RegexLit, $P.Template, $P.Dq, $P.Sq) @($P.LineC, $P.BlockC) 'strip' $AggrLines
+    go     = New-LangSpec @($P.GoRaw, $P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip' $AggrLines
+    rust   = New-LangSpec @($P.RustRaw, $P.Dq, $P.Char) @($P.LineC, $P.BlockC) 'strip' $AggrJoin
+    php    = New-LangSpec @($P.Dq, $P.Sq) @($P.LineC, $P.BlockC, $P.PhpHash) 'strip' $AggrLines
+    css    = New-LangSpec @($P.CssUrl, $P.Dq, $P.Sq) @($P.BlockC) 'strip' $AggrCss
+    scss   = New-LangSpec @($P.CssUrl, $P.Dq, $P.Sq) @($P.LineC, $P.BlockC) 'strip' $AggrCss
     sql    = New-LangSpec @($P.DoubledSq, $P.PlainDq) @($P.DashC, $P.BlockC) 'strip'
     python = New-LangSpec @($P.TripleDq, $P.TripleSq, $P.Dq, $P.Sq) @($P.Hash) 'indent'
     ruby   = New-LangSpec @($P.Dq, $P.Sq) @($P.RubyBlock, $P.Hash) 'strip'
@@ -159,14 +202,17 @@ $Specs = @{
     lua    = New-LangSpec @($P.LuaLong, $P.Dq, $P.Sq) @($P.LuaBlockC, $P.DashC) 'strip'
     r      = New-LangSpec @($P.Dq, $P.Sq) @($P.Hash) 'strip'
     json   = New-LangSpec @($P.Dq) @($P.LineC, $P.BlockC) 'json'
-    markup = New-LangSpec @() @($P.HtmlC) 'strip'
+    xml    = New-LangSpec @() @($P.HtmlC) 'strip' @{ Style = 'xml' }
+    html   = New-LangSpec @() @($P.HtmlC) 'strip' @{ Style = 'html' }
 }
 
 $ExtensionMap = @{}
 $langExts = @{
     c      = 'c h cpp cc cxx hpp hh hxx m mm ino'
     cs     = 'cs'
-    jvm    = 'java kt kts scala sc swift'
+    java   = 'java'
+    jvm    = 'kt kts scala sc'
+    swift  = 'swift'
     groovy = 'groovy gradle dart'
     js     = 'js jsx mjs cjs ts tsx mts cts'
     go     = 'go'
@@ -182,7 +228,8 @@ $langExts = @{
     lua    = 'lua'
     r      = 'r'
     json   = 'json jsonc ipynb'
-    markup = 'html htm xhtml xml xaml xsd csproj vbproj fsproj props targets config resx plist vue svelte cshtml razor'
+    xml    = 'xml xaml xsd csproj vbproj fsproj props targets config resx plist'
+    html   = 'html htm xhtml vue svelte cshtml razor'
 }
 foreach ($lang in $langExts.Keys) {
     foreach ($ext in $langExts[$lang] -split ' ') { $ExtensionMap[$ext] = $Specs[$lang] }
@@ -202,8 +249,65 @@ function Get-LangSpec {
 
 #region Minification
 
+# Runs after the normal minification, on text where string literals have been
+# replaced by placeholders, so none of these rules can touch string contents.
+function Convert-AggressiveContent {
+    param([string]$Text, [hashtable]$Aggr)
+
+    switch ($Aggr.Style) {
+        'join' {
+            # Line breaks are plain whitespace in these languages, so put
+            # everything on one line. Preprocessor directives (and their \
+            # continuations) must keep their own lines.
+            $out = [System.Collections.Generic.List[string]]::new()
+            $chunk = [System.Collections.Generic.List[string]]::new()
+            $flush = {
+                if ($chunk.Count) {
+                    $one = [regex]::Replace(($chunk -join ' '), '[ \t]{2,}', ' ')
+                    $out.Add([regex]::Replace($one, $Aggr.Spacing, ''))
+                    $chunk.Clear()
+                }
+            }
+            $inDirective = $false
+            foreach ($line in $Text -split "`n") {
+                if ($Aggr.Directives -and ($inDirective -or $line.StartsWith('#'))) {
+                    . $flush
+                    $out.Add($line)
+                    $inDirective = $line.EndsWith('\')
+                } else {
+                    $chunk.Add($line)
+                }
+            }
+            . $flush
+            return $out -join "`n"
+        }
+        'lines' {
+            # A line break can end a statement here (JS ASI, optional semicolons),
+            # so only drop the ones that can't: after an opening bracket, comma,
+            # semicolon or '=', and before a closing bracket or a .method() chain.
+            # Lines starting with '#' (Swift #if, JS #private) are left alone.
+            $Text = [regex]::Replace($Text, "(?<=[$($Aggr.JoinAfter)])\n(?!#)|(?<!(?:^|\n)#[^\n]*)\n(?=[})\].])", '')
+            if ($Aggr.Spacing) { $Text = [regex]::Replace($Text, $Aggr.Spacing, '') }
+            return $Text
+        }
+        'xml' {
+            $Text = [regex]::Replace($Text, '^<\?xml[^>]*\?>', '')
+            $Text = [regex]::Replace($Text, '\s+', ' ')
+            $Text = $Text.Replace('> <', '><')
+            $Text = [regex]::Replace($Text, ' (?=/?>)', '')
+            return [regex]::Replace($Text, ' ?= ?(?=["' + $q + '])', '=')
+        }
+        'html' {
+            # only between tags: <script> blocks inside still need their line breaks
+            $Text = [regex]::Replace($Text, '>\s+<', '><')
+            return [regex]::Replace($Text, '[ \t]+(?=/?>)', '')
+        }
+    }
+    return $Text
+}
+
 function Convert-MinifiedContent {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Content, $Spec)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Content, $Spec, [switch]$Aggressive)
 
     $text = $Content -replace "\r\n?", "`n"
 
@@ -273,6 +377,19 @@ function Convert-MinifiedContent {
                 $segs[$i] = [regex]::Replace($segs[$i], '\n( +)', $evaluator)
             }
         }
+    }
+
+    if ($Aggressive -and $Spec.Aggr) {
+        # Swap each string for a placeholder so the aggressive rules can work
+        # across the whole file without seeing string contents.
+        $sb = [System.Text.StringBuilder]::new()
+        for ($i = 0; $i -lt $segs.Count; $i++) {
+            if ($i % 2) { [void]$sb.Append([char]0xE000).Append($i).Append([char]0xE001) }
+            else { [void]$sb.Append($segs[$i]) }
+        }
+        $joined = Convert-AggressiveContent -Text $sb.ToString().Trim() -Aggr $Spec.Aggr
+        $restore = { param($m) $segs[[int]$m.Groups[1].Value] }.GetNewClosure()
+        return [regex]::Replace($joined, '(\d+)', $restore).Trim()
     }
 
     return ($segs -join '').Trim()
@@ -493,7 +610,7 @@ foreach ($rel in $relPaths) {
     }
 
     $original = [System.IO.File]::ReadAllText($full)
-    $output = Convert-MinifiedContent -Content $original -Spec (Get-LangSpec $name)
+    $output = Convert-MinifiedContent -Content $original -Spec (Get-LangSpec $name) -Aggressive:$Aggressive
     if (-not $output) { continue }
 
     Write-Verbose "Adding: $rel"
@@ -508,8 +625,9 @@ if ($included -eq 0) {
     return
 }
 
+$removed = if ($Aggressive) { 'comments, indentation, and most line breaks and spaces' } else { 'comments, blank lines and indentation' }
 $preamble = "Source files from project '$rootName' ($included files). Each file starts with a '==> path <==' line. " +
-    "Code has been minified to save tokens: comments, blank lines and indentation were removed " +
+    "Code has been minified to save tokens: $removed were removed " +
     "(Python indentation is kept at 1 space per level).`n"
 
 $outDir = Split-Path $outFull -Parent
